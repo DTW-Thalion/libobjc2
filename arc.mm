@@ -211,19 +211,25 @@ static void emptyPool(struct arc_tls *tls, void *stop)
 #ifdef arc_tls_store
 static TLS_CALLBACK(cleanupPools)(struct arc_tls* tls)
 {
+	for (int iterations = 0; iterations < 16; iterations++)
+	{
+		if (tls->returnRetained)
+		{
+			id retained = tls->returnRetained;
+			tls->returnRetained = nil;
+			release(retained);
+		}
+		if (NULL != tls->pool)
+		{
+			emptyPool(tls, NULL);
+		}
+		if (!tls->returnRetained) break;
+	}
+	// Final cleanup of any remaining
 	if (tls->returnRetained)
 	{
 		release(tls->returnRetained);
 		tls->returnRetained = nil;
-	}
-	if (NULL != tls->pool)
-	{
-		emptyPool(tls, NULL);
-		assert(NULL == tls->pool);
-	}
-	if (tls->returnRetained)
-	{
-		cleanupPools(tls);
 	}
 	free(tls);
 }
@@ -252,8 +258,9 @@ static const size_t refcount_max = refcount_mask - 1;
 
 extern "C" OBJC_PUBLIC size_t object_getRetainCount_np(id obj)
 {
+	if (nil == obj) { return 0; }
 	uintptr_t *refCount = ((uintptr_t*)obj) - 1;
-	uintptr_t refCountVal = __sync_fetch_and_add(refCount, 0);
+	uintptr_t refCountVal = __atomic_load_n(refCount, __ATOMIC_SEQ_CST);
 	size_t realCount = refCountVal & refcount_mask;
 	return realCount == refcount_mask ? 0 : realCount + 1;
 }
@@ -261,7 +268,7 @@ extern "C" OBJC_PUBLIC size_t object_getRetainCount_np(id obj)
 static id retain_fast(id obj, BOOL isWeak)
 {
 	uintptr_t *refCount = ((uintptr_t*)obj) - 1;
-	uintptr_t refCountVal = __sync_fetch_and_add(refCount, 0);
+	uintptr_t refCountVal = __atomic_load_n(refCount, __ATOMIC_SEQ_CST);
 	uintptr_t newVal = refCountVal;
 	do {
 		refCountVal = newVal;
@@ -338,7 +345,7 @@ static inline id retain(id obj, BOOL isWeak)
 extern "C" OBJC_PUBLIC BOOL objc_release_fast_no_destroy_np(id obj)
 {
 	uintptr_t *refCount = ((uintptr_t*)obj) - 1;
-	uintptr_t refCountVal = __sync_fetch_and_add(refCount, 0);
+	uintptr_t refCountVal = __atomic_load_n(refCount, __ATOMIC_SEQ_CST);
 	uintptr_t newVal = refCountVal;
 	bool isWeak;
 	bool shouldFree;
@@ -401,10 +408,19 @@ static inline void release(id obj)
 	return ManualRetainReleaseMessage(obj, release, void(*)(id, SEL));
 }
 
+static int autorelease_initialized = 0;
+
 static inline void initAutorelease(void)
 {
-	if (Nil == AutoreleasePool)
+	// Fast path: already initialized
+	if (__atomic_load_n(&autorelease_initialized, __ATOMIC_ACQUIRE)) return;
+
+	// CAS to claim initialization (0 -> -1)
+	int expected = 0;
+	if (__atomic_compare_exchange_n(&autorelease_initialized, &expected, -1,
+	                                false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
 	{
+		// We won the race, perform initialization
 		AutoreleasePool = objc_getClass("NSAutoreleasePool");
 		if (Nil == AutoreleasePool)
 		{
@@ -424,6 +440,16 @@ static inline void initAutorelease(void)
 				AutoreleaseAdd = class_getMethodImplementation(object_getClass(AutoreleasePool),
 				                                               SELECTOR(addObject:));
 			}
+		}
+		// Mark initialization complete
+		__atomic_store_n(&autorelease_initialized, 1, __ATOMIC_RELEASE);
+	}
+	else
+	{
+		// Losing thread: spin until initialization is complete
+		while (__atomic_load_n(&autorelease_initialized, __ATOMIC_ACQUIRE) != 1)
+		{
+			// spin
 		}
 	}
 }
@@ -593,6 +619,7 @@ extern "C" OBJC_PUBLIC id objc_retainAutoreleasedReturnValue(id obj)
 		if (useARCAutoreleasePool)
 		{
 			if ((NULL != tls->pool) &&
+			    (tls->pool->insert > tls->pool->pool) &&
 			    (*(tls->pool->insert-1) == obj))
 			{
 				tls->pool->insert--;
@@ -639,6 +666,7 @@ extern "C" OBJC_PUBLIC void objc_release(id obj)
 
 extern "C" OBJC_PUBLIC id objc_storeStrong(id *addr, id value)
 {
+	if (NULL == addr) { return nil; }
 	value = objc_retain(value);
 	id oldValue = *addr;
 	*addr = value;
