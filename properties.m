@@ -76,6 +76,7 @@ void objc_setProperty(id obj, SEL _cmd, ptrdiff_t offset, id arg, BOOL isAtomic,
 OBJC_PUBLIC
 void objc_setProperty_atomic(id obj, SEL _cmd, id arg, ptrdiff_t offset)
 {
+	if (nil == obj) { return; }
 	char *addr = (char*)obj;
 	addr += offset;
 	arg = objc_retain(arg);
@@ -90,6 +91,7 @@ void objc_setProperty_atomic(id obj, SEL _cmd, id arg, ptrdiff_t offset)
 OBJC_PUBLIC
 void objc_setProperty_atomic_copy(id obj, SEL _cmd, id arg, ptrdiff_t offset)
 {
+	if (nil == obj) { return; }
 	char *addr = (char*)obj;
 	addr += offset;
 
@@ -105,6 +107,7 @@ void objc_setProperty_atomic_copy(id obj, SEL _cmd, id arg, ptrdiff_t offset)
 OBJC_PUBLIC
 void objc_setProperty_nonatomic(id obj, SEL _cmd, id arg, ptrdiff_t offset)
 {
+	if (nil == obj) { return; }
 	char *addr = (char*)obj;
 	addr += offset;
 	arg = objc_retain(arg);
@@ -116,6 +119,7 @@ void objc_setProperty_nonatomic(id obj, SEL _cmd, id arg, ptrdiff_t offset)
 OBJC_PUBLIC
 void objc_setProperty_nonatomic_copy(id obj, SEL _cmd, id arg, ptrdiff_t offset)
 {
+	if (nil == obj) { return; }
 	char *addr = (char*)obj;
 	addr += offset;
 	id old = *(id*)addr;
@@ -130,10 +134,16 @@ void objc_copyCppObjectAtomic(void *dest, const void *src,
 	volatile int *lock = lock_for_pointer(src < dest ? src : dest);
 	volatile int *lock2 = lock_for_pointer(src < dest ? dest : src);
 	lock_spinlock(lock);
-	lock_spinlock(lock2);
+	if (lock != lock2)
+	{
+		lock_spinlock(lock2);
+	}
 	copyHelper(dest, src);
+	if (lock != lock2)
+	{
+		unlock_spinlock(lock2);
+	}
 	unlock_spinlock(lock);
-	unlock_spinlock(lock2);
 }
 
 OBJC_PUBLIC
@@ -175,10 +185,16 @@ void objc_copyPropertyStruct(void *dest,
 		volatile int *lock = lock_for_pointer(src < dest ? src : dest);
 		volatile int *lock2 = lock_for_pointer(src < dest ? dest : src);
 		lock_spinlock(lock);
-		lock_spinlock(lock2);
+		if (lock != lock2)
+		{
+			lock_spinlock(lock2);
+		}
 		memcpy(dest, src, size);
+		if (lock != lock2)
+		{
+			unlock_spinlock(lock2);
+		}
 		unlock_spinlock(lock);
-		unlock_spinlock(lock2);
 	}
 	else
 	{

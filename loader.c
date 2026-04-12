@@ -37,19 +37,13 @@ __attribute__((weak)) void (*_dispatch_end_NSAutoReleasePool)(void *);
 
 static void init_runtime(void)
 {
-	static BOOL first_run = YES;
-	if (first_run)
+	// Atomic init_state: 0 = not started, 1 = in progress, 2 = done.
+	// Uses CAS to ensure exactly one thread performs initialization,
+	// even when two threads race into dlopen() concurrently.
+	static volatile int init_state = 0;
+	if (__sync_bool_compare_and_swap(&init_state, 0, 1))
 	{
-		// Create the main runtime lock.  This is not safe in theory, but in
-		// practice the first time that this function is called will be in the
-		// loader, from the main thread.  Future loaders may run concurrently,
-		// but that is likely to break the semantics of a lot of languages, so
-		// we don't have to worry about it for a long time.
-		//
-		// The only case when this can potentially go badly wrong is when a
-		// pure-C main() function spawns two threads which then, concurrently,
-		// call dlopen() or equivalent, and the platform's implementation of
-		// this does not perform any synchronization.
+		// We won the CAS race — perform initialization.
 		INIT_LOCK(runtime_mutex);
 		// Create the various tables that the runtime needs.
 		init_selector_tables();
@@ -63,7 +57,6 @@ static void init_runtime(void)
 		init_trampolines();
 #endif
 		init_builtin_classes();
-		first_run = NO;
 		if (getenv("LIBOBJC_MEMORY_PROFILE"))
 		{
 			atexit(log_memory_stats);
@@ -79,6 +72,17 @@ static void init_runtime(void)
 		}
 		if (_dispatch_end_NSAutoReleasePool != 0) {
 			_dispatch_end_NSAutoReleasePool = objc_autoreleasePoolPop;
+		}
+		// Release fence so all init writes are visible before state=2.
+		__sync_synchronize();
+		init_state = 2;
+	}
+	else
+	{
+		// Another thread is initializing or has finished.  Spin until done.
+		while (init_state != 2)
+		{
+			__sync_synchronize();
 		}
 	}
 }

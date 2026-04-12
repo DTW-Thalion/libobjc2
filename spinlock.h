@@ -1,12 +1,8 @@
 #ifdef _WIN32
 #include "safewindows.h"
-static unsigned sleep(unsigned seconds)
-{
-	Sleep(seconds*1000);
-	return 0;
-}
 #else
 #include <unistd.h>
+#include <sched.h>
 #endif
 
 /**
@@ -70,11 +66,27 @@ inline static void lock_spinlock(volatile int *spinlock)
 	while(!__sync_bool_compare_and_swap(spinlock, 0, 1))
 	{
 		count++;
-		if (0 == count % 10)
+		if (count <= 40)
 		{
-			// If it is already 1, let another thread play with the CPU for a
-			// bit then try again.
-			sleep(0);
+			// Spin with CPU-friendly pause hint for the first 40 iterations.
+#if defined(__i386__) || defined(__x86_64__)
+			__builtin_ia32_pause();
+#elif defined(__arm__) || defined(__aarch64__)
+			__asm__ __volatile__("yield");
+#endif
+		}
+		else
+		{
+			// After spinning, yield to the OS scheduler to avoid
+			// priority inversion when the lock holder is preempted.
+#ifdef _WIN32
+			SleepEx(0, FALSE);
+#else
+			sched_yield();
+#endif
+			// Reset to 30 to allow another short spin burst before
+			// yielding again, in case the lock is about to be released.
+			count = 30;
 		}
 	}
 }

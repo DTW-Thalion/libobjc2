@@ -346,11 +346,15 @@ Protocol*__unsafe_unretained* protocol_copyProtocolList(Protocol *p, unsigned in
 objc_property_t *protocol_copyPropertyList2(Protocol *p, unsigned int *outCount,
 		BOOL isRequiredProperty, BOOL isInstanceProperty)
 {
+	if (NULL == p)
+	{
+		if (NULL != outCount) { *outCount = 0; }
+		return NULL;
+	}
 	struct objc_property_list *properties =
 	    isInstanceProperty ?
 	        (isRequiredProperty ? p->properties : p->optional_properties) :
 	        (isRequiredProperty ? p->class_properties : p->optional_class_properties);
-	if (NULL == p) { return NULL; }
 	// If it's an old protocol, it won't have any of the other options.
 	if (!isRequiredProperty && !isInstanceProperty &&
 	    !protocol_hasOptionalMethodsAndProperties(p))

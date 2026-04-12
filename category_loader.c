@@ -14,16 +14,19 @@ static void register_methods(struct objc_class *cls, struct objc_method_list *l)
 {
 	if (NULL == l) { return; }
 
-	// Add the method list at the head of the list of lists.
-	l->next = cls->methods;
-	cls->methods = l;
-	// Update the dtable to catch the new methods, if the dtable has been
-	// created (don't bother creating dtables for classes when categories are
-	// loaded if the class hasn't received any messages yet.
+	// Update the dtable BEFORE linking the method list into cls->methods.
+	// This ensures that any concurrent reader walking the method list will
+	// only see entries that are already reflected in the dtable.
 	if (classHasDtable(cls))
 	{
 		add_method_list_to_class(cls, l);
 	}
+	// Release fence ensures the dtable update is visible to other threads
+	// before the method list becomes reachable via cls->methods.
+	__atomic_thread_fence(__ATOMIC_RELEASE);
+	// Now link the method list at the head of the list of lists.
+	l->next = cls->methods;
+	cls->methods = l;
 }
 
 static void load_category(struct objc_category *cat, struct objc_class *class)

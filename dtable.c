@@ -44,7 +44,7 @@ PRIVATE mutex_t initialize_lock;
 static uint32_t dtable_depth = 8;
 
 #ifndef NO_SAFE_CACHING
-_Atomic(uint64_t) objc_method_cache_version;
+__attribute__((aligned(64))) _Atomic(uint64_t) objc_method_cache_version;
 #endif
 
 /**
@@ -716,7 +716,18 @@ static void remove_dtable(InitializingDtable* meta_buffer)
 }
 
 /**
- * Send a +initialize message to the receiver, if required.  
+ * Send a +initialize message to the receiver, if required.
+ *
+ * Lock ordering (must always be acquired in this order to avoid deadlock):
+ *
+ *   1. LOCK_OBJECT(meta)     — per-class @synchronize lock on the metaclass
+ *   2. runtime_mutex          — global runtime lock (LOCK_RUNTIME)
+ *   3. initialize_lock        — protects the temporary_dtables list
+ *
+ * The runtime lock is released before calling +initialize to allow other
+ * threads to proceed with unrelated class lookups.  The class-level
+ * LOCK_OBJECT(meta) is held for the entire duration of +initialize to
+ * serialize concurrent initializations of the same class.
  */
 OBJC_PUBLIC void objc_send_initialize(id object)
 {

@@ -195,8 +195,13 @@ static int PREFIX(_table_resize)(PREFIX(_table) *table)
 			PREFIX(_insert)(table, value);
 		}
 	}
-	__sync_synchronize();
+	// Release fence ensures all table data writes from the copy loop are
+	// visible to concurrent readers before we swap the table pointer.
+	__atomic_thread_fence(__ATOMIC_RELEASE);
 	table->old = NULL;
+	// Second release fence ensures the NULL write to old is visible before
+	// any subsequent operations that might free the old table.
+	__atomic_thread_fence(__ATOMIC_RELEASE);
 #	if !defined(ENABLE_GC) && defined(MAP_TABLE_SINGLE_THREAD)
 	free(copy->table);
 	free(copy);
@@ -212,9 +217,12 @@ struct PREFIX(_table_enumerator)
 	unsigned int index;
 };
 
-static inline PREFIX(_table_cell) PREFIX(_table_lookup)(PREFIX(_table) *table, 
+static inline PREFIX(_table_cell) PREFIX(_table_lookup)(PREFIX(_table) *table,
                                                         uint32_t hash)
 {
+	// Acquire fence ensures we see consistent table data after reading the
+	// table pointer, which may have been updated by a concurrent resize.
+	__atomic_thread_fence(__ATOMIC_ACQUIRE);
 	hash = hash % TABLE_SIZE(table);
 	return &table->table[hash];
 }
