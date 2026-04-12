@@ -728,13 +728,27 @@ using weak_ref_table = tsl::robin_pg_map<const void*,
                                          std::equal_to<const void*>,
                                          malloc_allocator<std::pair<const void*, WeakRef*>>>;
 
-weak_ref_table &weakRefs()
-{
-	static weak_ref_table w{128};
-	return w;
+#define WEAK_LOCK_COUNT 64
+#define WEAK_LOCK_MASK (WEAK_LOCK_COUNT - 1)
+
+struct alignas(64) PaddedWeakStripe {
+	mutex_t lock;
+	weak_ref_table table{128};
+};
+
+static PaddedWeakStripe weakStripes[WEAK_LOCK_COUNT];
+
+static inline unsigned weakIndexForPointer(const void *ptr) {
+	return ((uintptr_t)ptr >> 4) & WEAK_LOCK_MASK;
 }
 
-mutex_t weakRefLock;
+static inline mutex_t *weakLockForPointer(const void *ptr) {
+	return &weakStripes[weakIndexForPointer(ptr)].lock;
+}
+
+static inline weak_ref_table &weakRefsForPointer(const void *ptr) {
+	return weakStripes[weakIndexForPointer(ptr)].table;
+}
 
 }
 
@@ -749,7 +763,10 @@ static const struct Block_callbacks_RR blocks_runtime_callbacks = {
 
 PRIVATE extern "C" void init_arc(void)
 {
-	INIT_LOCK(weakRefLock);
+	for (int i = 0; i < WEAK_LOCK_COUNT; i++)
+	{
+		INIT_LOCK(weakStripes[i].lock);
+	}
 #ifdef arc_tls_store
 	ARCThreadKey = arc_tls_key_create((arc_cleanup_function_t)cleanupPools);
 #endif
@@ -791,7 +808,7 @@ static inline BOOL weakRefRelease(WeakRef *ref)
 	ref->weak_count--;
 	if (ref->weak_count == 0)
 	{
-		weakRefs().erase(ref->obj);
+		weakRefsForPointer(ref->obj).erase(ref->obj);
 		delete ref;
 		return YES;
 	}
@@ -844,7 +861,7 @@ static BOOL setObjectHasWeakRefs(id obj)
 
 WeakRef *incrementWeakRefCount(id obj)
 {
-	WeakRef *&ref = weakRefs()[obj];
+	WeakRef *&ref = weakRefsForPointer(obj)[obj];
 	if (ref == nullptr)
 	{
 		ref = new WeakRef(obj);
@@ -859,14 +876,36 @@ WeakRef *incrementWeakRefCount(id obj)
 
 extern "C" OBJC_PUBLIC id objc_storeWeak(id *addr, id obj)
 {
-	LOCK_FOR_SCOPE(&weakRefLock);
+	// We need to lock for both the old object (being removed) and the new
+	// object (being stored).  Peek at the old value to determine its lock.
 	WeakRef *oldRef;
 	id old;
 	loadWeakPointer(addr, &old, &oldRef);
+
+	// Acquire locks for both old and new objects in pointer order to avoid
+	// deadlock.  Use the old object if it exists, otherwise the new one.
+	const void *oldKey = old ? (const void *)old : (const void *)obj;
+	const void *newKey = obj ? (const void *)obj : oldKey;
+	mutex_t *lock1 = weakLockForPointer(oldKey);
+	mutex_t *lock2 = weakLockForPointer(newKey);
+	if (lock1 > lock2)
+	{
+		mutex_t *tmp = lock1;
+		lock1 = lock2;
+		lock2 = tmp;
+	}
+	LOCK(lock1);
+	if (lock1 != lock2) LOCK(lock2);
+
+	// Re-read under lock in case another thread changed *addr.
+	loadWeakPointer(addr, &old, &oldRef);
+
 	// If the old and new values are the same, then we don't need to do anything
 	// unless we are deleting the weak reference by storing NULL to it.
 	if ((old == obj) && ((obj != NULL) || (NULL == oldRef)))
 	{
+		if (lock1 != lock2) UNLOCK(lock2);
+		UNLOCK(lock1);
 		return obj;
 	}
 	BOOL isGlobalObject = setObjectHasWeakRefs(obj);
@@ -880,6 +919,8 @@ extern "C" OBJC_PUBLIC id objc_storeWeak(id *addr, id obj)
 	if (nil == obj)
 	{
 		*addr = obj;
+		if (lock1 != lock2) UNLOCK(lock2);
+		UNLOCK(lock1);
 		return nil;
 	}
 	if (isGlobalObject)
@@ -887,6 +928,8 @@ extern "C" OBJC_PUBLIC id objc_storeWeak(id *addr, id obj)
 		// If this is a global object, it's never deallocated, so secretly make
 		// this a strong reference.
 		*addr = obj;
+		if (lock1 != lock2) UNLOCK(lock2);
+		UNLOCK(lock1);
 		return obj;
 	}
 	Class cls = classForObject(obj);
@@ -895,6 +938,8 @@ extern "C" OBJC_PUBLIC id objc_storeWeak(id *addr, id obj)
 		// Check whether the block is being deallocated and return nil if so
 		if (_Block_isDeallocating(obj)) {
 			*addr = nil;
+			if (lock1 != lock2) UNLOCK(lock2);
+			UNLOCK(lock1);
 			return nil;
 		}
 	}
@@ -902,18 +947,22 @@ extern "C" OBJC_PUBLIC id objc_storeWeak(id *addr, id obj)
 	{
 		// If the object is being deallocated return nil.
 		*addr = nil;
+		if (lock1 != lock2) UNLOCK(lock2);
+		UNLOCK(lock1);
 		return nil;
 	}
 	if (nil != obj)
 	{
 		*addr = (id)incrementWeakRefCount(obj);
 	}
+	if (lock1 != lock2) UNLOCK(lock2);
+	UNLOCK(lock1);
 	return obj;
 }
 
 extern "C" OBJC_PUBLIC BOOL objc_delete_weak_refs(id obj)
 {
-	LOCK_FOR_SCOPE(&weakRefLock);
+	LOCK_FOR_SCOPE(weakLockForPointer(obj));
 	if (objc_test_class_flag(classForObject(obj), objc_class_flag_fast_arc))
 	{
 		// Don't proceed if the object isn't deallocating.
@@ -925,7 +974,7 @@ extern "C" OBJC_PUBLIC BOOL objc_delete_weak_refs(id obj)
 			return NO;
 		}
 	}
-	auto &table = weakRefs();
+	auto &table = weakRefsForPointer(obj);
 	auto old = table.find(obj);
 	if (old != table.end())
 	{
@@ -948,7 +997,24 @@ extern "C" OBJC_PUBLIC BOOL objc_delete_weak_refs(id obj)
 
 extern "C" OBJC_PUBLIC id objc_loadWeakRetained(id* addr)
 {
-	LOCK_FOR_SCOPE(&weakRefLock);
+	// Peek at the address to determine which stripe to lock.
+	// We use the value stored at addr: if it's a WeakRef, use the object it
+	// points to; if it's a direct object or nil, use that.
+	id peek = *addr;
+	const void *lockKey;
+	if (peek == nil)
+	{
+		return nil;
+	}
+	if (classForObject(peek) == (Class)&weakref_class)
+	{
+		lockKey = (const void *)((WeakRef*)peek)->obj;
+	}
+	else
+	{
+		lockKey = (const void *)peek;
+	}
+	LOCK_FOR_SCOPE(weakLockForPointer(lockKey));
 	id obj;
 	WeakRef *ref;
 	// If this is really a strong reference (nil, or an non-deallocatable
@@ -1011,7 +1077,13 @@ extern "C" OBJC_PUBLIC void objc_copyWeak(id *dest, id *src)
 	// `src` is a valid pointer to a __weak pointer or nil.
 	// `dest` is a valid pointer to uninitialised memory.
 	// After this operation, `dest` should contain whatever `src` contained.
-	LOCK_FOR_SCOPE(&weakRefLock);
+	id peek = *src;
+	const void *lockKey = (const void *)peek;
+	if (peek && classForObject(peek) == (Class)&weakref_class)
+	{
+		lockKey = (const void *)((WeakRef*)peek)->obj;
+	}
+	LOCK_FOR_SCOPE(weakLockForPointer(lockKey));
 	id obj;
 	WeakRef *srcRef;
 	loadWeakPointer(src, &obj, &srcRef);
@@ -1034,14 +1106,26 @@ extern "C" OBJC_PUBLIC void objc_moveWeak(id *dest, id *src)
 	// optimise this by doing an atomic exchange of `*src` with `nil` and
 	// storing the result in `dest`, but it's probably not worth it unless weak
 	// references are a bottleneck.
-	LOCK_FOR_SCOPE(&weakRefLock);
+	id peek = *src;
+	const void *lockKey = (const void *)peek;
+	if (peek && classForObject(peek) == (Class)&weakref_class)
+	{
+		lockKey = (const void *)((WeakRef*)peek)->obj;
+	}
+	LOCK_FOR_SCOPE(weakLockForPointer(lockKey));
 	*dest = *src;
 	*src = nil;
 }
 
 extern "C" OBJC_PUBLIC void objc_destroyWeak(id* obj)
 {
-	LOCK_FOR_SCOPE(&weakRefLock);
+	id peek = *obj;
+	const void *lockKey = (const void *)peek;
+	if (peek && classForObject(peek) == (Class)&weakref_class)
+	{
+		lockKey = (const void *)((WeakRef*)peek)->obj;
+	}
+	LOCK_FOR_SCOPE(weakLockForPointer(lockKey));
 	WeakRef *oldRef;
 	id old;
 	loadWeakPointer(obj, &old, &oldRef);
@@ -1060,7 +1144,7 @@ extern "C" OBJC_PUBLIC id objc_initWeak(id *addr, id obj)
 		*addr = nil;
 		return nil;
 	}
-	LOCK_FOR_SCOPE(&weakRefLock);
+	LOCK_FOR_SCOPE(weakLockForPointer(obj));
 	BOOL isGlobalObject = setObjectHasWeakRefs(obj);
 	if (isGlobalObject)
 	{
