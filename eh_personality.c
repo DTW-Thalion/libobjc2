@@ -41,13 +41,32 @@ struct __cxa_eh_globals
 };
 
 
-// Weak references to C++ runtime functions.  We don't bother testing that
-// these are 0 before calling them, because if they are not resolved then we
-// should not be in a code path that involves a C++ exception.
+// Weak references to C++ runtime functions.  These may be NULL if the C++
+// runtime is not linked, so all call sites must use the safe_ wrappers below.
 __attribute__((weak)) void *__cxa_begin_catch(void *e);
 __attribute__((weak)) void __cxa_end_catch(void);
 __attribute__((weak)) void __cxa_rethrow(void);
 __attribute__((weak)) struct __cxa_eh_globals *__cxa_get_globals(void);
+
+/**
+ * Safe wrappers for weak C++ runtime symbols (RB-9).
+ * These check for NULL before calling, preventing crashes when the C++
+ * runtime is not linked.
+ */
+static inline void *safe_cxa_begin_catch(void *e) {
+	if (__cxa_begin_catch) return __cxa_begin_catch(e);
+	return NULL;
+}
+static inline void safe_cxa_end_catch(void) {
+	if (__cxa_end_catch) __cxa_end_catch();
+}
+static inline void safe_cxa_rethrow(void) {
+	if (__cxa_rethrow) __cxa_rethrow();
+}
+static inline struct __cxa_eh_globals *safe_cxa_get_globals(void) {
+	if (__cxa_get_globals) return __cxa_get_globals();
+	return NULL;
+}
 
 
 /**
@@ -56,7 +75,12 @@ __attribute__((weak)) struct __cxa_eh_globals *__cxa_get_globals(void);
 static const uint64_t objc_exception_class = EXCEPTION_CLASS('G','N','U','C','O','B','J','C');
 
 /**
- * Structure used as a header on thrown exceptions.  
+ * Structure used as a header on thrown exceptions.
+ *
+ * NOTE (RB-13 / MSVC interop): This struct's layout must remain stable for
+ * cross-compiler compatibility.  Fields are ordered to avoid padding on both
+ * LP64 and LLP64 (MSVC) data models.  If you modify this struct, verify
+ * sizeof(struct objc_exception) on all target compilers.
  */
 struct objc_exception
 {
@@ -192,6 +216,15 @@ static inline _Unwind_Reason_Code continueUnwinding(struct _Unwind_Exception *ex
 	return _URC_CONTINUE_UNWIND;
 }
 
+/**
+ * Exception cleanup callback (RB-12).
+ *
+ * Intentionally a no-op.  The Objective-C exception lifecycle manages memory
+ * in objc_end_catch() and objc_exception_rethrow() rather than in this
+ * unwind-time callback.  The commented-out code below is the "obvious"
+ * implementation, but calling it here would cause double-frees because the
+ * catch/rethrow paths already free the objc_exception wrapper.
+ */
 static void cleanup(_Unwind_Reason_Code reason, struct _Unwind_Exception *e)
 {
 	/*
@@ -221,11 +254,11 @@ void objc_exception_throw(id object)
 	// cases.
 	if (td->cxxCaughtException)
 	{
-		struct __cxa_eh_globals *globals = __cxa_get_globals();
-		if ((globals->caughtExceptions != NULL) &&
+		struct __cxa_eh_globals *globals = safe_cxa_get_globals();
+		if (globals && (globals->caughtExceptions != NULL) &&
 		    (*(id*)globals->caughtExceptions == object))
 		{
-			__cxa_rethrow();
+			safe_cxa_rethrow();
 		}
 	}
 
@@ -258,6 +291,7 @@ void objc_exception_throw(id object)
 		_objc_unexpected_exception(object);
 	}
 	DEBUG_LOG("Throw returned %d\n",(int) err);
+	fprintf(stderr, "libobjc2: _Unwind_RaiseException returned %d, cannot continue\n", (int)err);
 	abort();
 }
 
@@ -354,8 +388,9 @@ static handler_type check_action_record(struct _Unwind_Context *context,
 		else
 		{
 			DEBUG_LOG("Filter value: %d\n"
-					"Your compiler and I disagree on the correct layout of EH data.\n", 
+					"Your compiler and I disagree on the correct layout of EH data.\n",
 					filter);
+			fprintf(stderr, "libobjc2: unexpected negative filter value %d in EH action record (ABI mismatch?)\n", filter);
 			abort();
 		}
 		*selector = 0;
@@ -640,6 +675,7 @@ OBJC_PUBLIC id objc_begin_catch(struct _Unwind_Exception *exceptionObject)
 	{
 		// FIXME: Actually, we can handle a C++ exception if only ObjC
 		// exceptions are in-flight
+		fprintf(stderr, "libobjc2: foreign exception caught while ObjC exceptions are in-flight (cannot chain)\n");
 		abort();
 	}
 #ifndef NO_OBJCXX
@@ -648,7 +684,7 @@ OBJC_PUBLIC id objc_begin_catch(struct _Unwind_Exception *exceptionObject)
 	{
 		DEBUG_LOG("c++ catch\n");
 		td->current_exception_type = CXX;
-		return __cxa_begin_catch(exceptionObject);
+		return safe_cxa_begin_catch(exceptionObject);
 	}
 #endif
 	DEBUG_LOG("foreign exception catch\n");
@@ -690,7 +726,7 @@ OBJC_PUBLIC void objc_end_catch(void)
 	// If this is a C++ exception, then just let the C++ runtime handle it.
 	if (td->current_exception_type == CXX)
 	{
-		__cxa_end_catch();
+		safe_cxa_end_catch();
 		td->current_exception_type = OBJC;
 		return;
 	}
@@ -735,18 +771,21 @@ OBJC_PUBLIC void objc_exception_rethrow(struct _Unwind_Exception *e)
 		// rethrown exception in objc_end_catch
 		ex->catch_count = -ex->catch_count;
 		_Unwind_Reason_Code err = _Unwind_Resume_or_Rethrow(e);
+		/* RB-1: Save object before free to avoid use-after-free */
+		id thrown_object = ex->object;
 		free(ex);
 		if (_URC_END_OF_STACK == err && 0 != _objc_unexpected_exception)
 		{
-			_objc_unexpected_exception(ex->object);
+			_objc_unexpected_exception(thrown_object);
 		}
+		fprintf(stderr, "libobjc2: _Unwind_Resume_or_Rethrow returned %d during objc_exception_rethrow\n", (int)err);
 		abort();
 	}
 #ifndef NO_OBJCXX
 	else if (td->current_exception_type == CXX)
 	{
 		assert(e->exception_class == cxx_exception_class);
-		__cxa_rethrow();
+		safe_cxa_rethrow();
 	}
 #endif
 	if (td->current_exception_type == BOXED_FOREIGN)
@@ -763,6 +802,7 @@ OBJC_PUBLIC void objc_exception_rethrow(struct _Unwind_Exception *e)
 	}
 	assert(e == (struct _Unwind_Exception*)td->caughtExceptions);
 	_Unwind_Resume_or_Rethrow(e);
+	fprintf(stderr, "libobjc2: _Unwind_Resume_or_Rethrow unexpectedly returned in objc_exception_rethrow\n");
 	abort();
 }
 
