@@ -100,6 +100,7 @@ struct objc_slot2 *objc_msg_lookup_internal(id *receiver, SEL selector, uint64_t
 		*version = objc_method_cache_version;
 #endif
 	}
+	if (UNLIKELY(selector == NULL)) { return NULL; }
 	Class class = classForObject((*receiver));
 retry:;
 	struct objc_slot2 * result = objc_dtable_lookup(class->dtable, selector->index);
@@ -189,7 +190,7 @@ struct objc_slot *objc_msg_lookup_sender(id *receiver, SEL selector, id sender)
 			{
 				t++;
 			}
-			switch (selector->types[0])
+			switch (*t)
 			{
 				case 'D': return &nil_slot_D_v1;
 				case 'd': return &nil_slot_d_v1;
@@ -225,7 +226,7 @@ static struct objc_slot2* objc_slot_lookup(id *receiver, SEL selector)
 			{
 				t++;
 			}
-			switch (selector->types[0])
+			switch (*t)
 			{
 				case 'D': return (struct objc_slot2*)&nil_slot_D;
 				case 'd': return (struct objc_slot2*)&nil_slot_d;
@@ -261,7 +262,7 @@ struct objc_slot2 *objc_slot_lookup_version(id *receiver, SEL selector, uint64_t
 			{
 				t++;
 			}
-			switch (selector->types[0])
+			switch (*t)
 			{
 				case 'D': return (struct objc_slot2*)&nil_slot_D;
 				case 'd': return (struct objc_slot2*)&nil_slot_d;
@@ -286,6 +287,7 @@ struct objc_slot2 *objc_slot_lookup_super2(struct objc_super *super, SEL selecto
 	if (receiver)
 	{
 		Class class = super->class;
+		if (UNLIKELY(Nil == class)) { return NULL; }
 		struct objc_slot2 * result = objc_dtable_lookup(dtable_for_class(class),
 				selector->index);
 		if (0 == result)
@@ -321,6 +323,7 @@ struct objc_slot *objc_slot_lookup_super(struct objc_super *super, SEL selector)
 	if (receiver)
 	{
 		Class class = super->class;
+		if (UNLIKELY(Nil == class)) { return NULL; }
 		struct objc_slot2 * result = objc_dtable_lookup(dtable_for_class(class),
 				selector->index);
 		if (0 == result)
