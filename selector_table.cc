@@ -120,6 +120,7 @@ inline TypeList *selLookup(uint32_t idx)
 
 BOOL isSelRegistered(SEL sel)
 {
+	LockGuard g{selector_table_lock};
 	if (sel->index < selector_list->size())
 	{
 		return YES;
@@ -130,6 +131,7 @@ BOOL isSelRegistered(SEL sel)
 /// Gets the name of a registered selector.
 const char *sel_getNameRegistered(SEL sel)
 {
+	LockGuard g{selector_table_lock};
 	const char *name = sel->name;
 	return selLookup_locked(sel->index)->name();
 }
@@ -140,6 +142,7 @@ const char *sel_getNameRegistered(SEL sel)
  */
 const char *sel_getNameNonUnique(SEL sel)
 {
+	LockGuard g{selector_table_lock};
 	const char *name = sel->name;
 	if (isSelRegistered(sel))
 	{
@@ -362,7 +365,8 @@ extern "C" void objc_resize_dtables(uint32_t);
  */
 extern "C" PRIVATE void init_selector_tables()
 {
-	selector_list = new std::vector<TypeList>(1<<16);
+	selector_list = new std::vector<TypeList>();
+	selector_list->reserve(1024);
 	selector_table = new SelectorTable(1024);
 	selector_table_lock.init();
 }
@@ -437,9 +441,17 @@ extern "C" PRIVATE SEL objc_register_selector(SEL aSel)
 	{
 		return aSel;
 	}
+	LockGuard g{selector_table_lock};
+	// Re-check registration under lock to avoid TOCTOU race
+	if (isSelRegistered(aSel))
+	{
+		return aSel;
+	}
 	UnregisteredSelector unregistered{aSel->name, aSel->types};
 	// Check that this isn't already registered, before we try
-	SEL registered = selector_lookup(aSel->name, aSel->types);
+	// Use selector_table->find() directly since we already hold the lock
+	auto result = selector_table->find(unregistered);
+	SEL registered = (result == selector_table->end()) ? nullptr : *result;
 	SelectorEqual eq;
 	if (nullptr != registered && eq(unregistered, registered))
 	{
@@ -447,7 +459,6 @@ extern "C" PRIVATE SEL objc_register_selector(SEL aSel)
 		return registered;
 	}
 	assert(!(aSel->types && (strstr(aSel->types, "@\"") != nullptr)));
-	LockGuard g{selector_table_lock};
 	register_selector_locked(aSel);
 	return aSel;
 }
@@ -495,7 +506,7 @@ SEL objc_register_selector_copy(UnregisteredSelector &aSel, BOOL copyArgs)
 		if (copy->types != nullptr)
 		{
 			copy->types = strdup(copy->types);
-			if (copy->name == nullptr)
+			if (copy->types == nullptr)
 			{
 				fprintf(stderr, "Failed to allocate memory for selector %s\n", aSel.name);
 				abort();
