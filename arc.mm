@@ -824,7 +824,7 @@ static BOOL setObjectHasWeakRefs(id obj)
 	if (obj && cls && objc_test_class_flag(cls, objc_class_flag_fast_arc))
 	{
 		uintptr_t *refCount = ((uintptr_t*)obj) - 1;
-		uintptr_t refCountVal = __sync_fetch_and_add(refCount, 0);
+		uintptr_t refCountVal = __atomic_load_n(refCount, __ATOMIC_SEQ_CST);
 		uintptr_t newVal = refCountVal;
 		do {
 			refCountVal = newVal;
@@ -967,7 +967,7 @@ extern "C" OBJC_PUBLIC BOOL objc_delete_weak_refs(id obj)
 	{
 		// Don't proceed if the object isn't deallocating.
 		uintptr_t *refCount = ((uintptr_t*)obj) - 1;
-		uintptr_t refCountVal = __sync_fetch_and_add(refCount, 0);
+		uintptr_t refCountVal = __atomic_load_n(refCount, __ATOMIC_SEQ_CST);
 		size_t realCount = refCountVal & refcount_mask;
 		if (realCount != refcount_mask)
 		{
