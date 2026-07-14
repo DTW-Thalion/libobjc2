@@ -691,12 +691,36 @@ static int weakref_class;
 namespace {
 
 /**
- * Number of stripes for the weak-reference table.  Every weak operation keys
+ * The weak-reference table is split into stripes.  Every weak operation keys
  * off a single object address (two, in the case of `objc_storeWeak`), so
- * sharding the table by object address lets weak traffic on unrelated objects
- * proceed without serialising on one global lock.  Must be a power of two.
+ * sharding by object address lets weak traffic on unrelated objects proceed
+ * without serialising on one global lock.
+ *
+ * OBJC_WEAK_SHARD_MAX is the compile-time upper bound (the storage reserved
+ * for the stripe array).  OBJC_WEAK_SHARD_COUNT is the default number of
+ * stripes actually used.  Both must be powers of two.  The active count can
+ * be tuned per process with the OBJC_WEAK_SHARD_COUNT environment variable
+ * (rounded down to a power of two, clamped to OBJC_WEAK_SHARD_MAX), so a
+ * deployment can spend a little more memory for more weak throughput without
+ * recompiling.
  */
-static const size_t weakShardCount = 64;
+#ifndef OBJC_WEAK_SHARD_MAX
+#define OBJC_WEAK_SHARD_MAX 256
+#endif
+#ifndef OBJC_WEAK_SHARD_COUNT
+#define OBJC_WEAK_SHARD_COUNT 64
+#endif
+static_assert((OBJC_WEAK_SHARD_MAX & (OBJC_WEAK_SHARD_MAX - 1)) == 0,
+              "OBJC_WEAK_SHARD_MAX must be a power of two");
+static_assert((OBJC_WEAK_SHARD_COUNT & (OBJC_WEAK_SHARD_COUNT - 1)) == 0,
+              "OBJC_WEAK_SHARD_COUNT must be a power of two");
+static_assert(OBJC_WEAK_SHARD_COUNT <= OBJC_WEAK_SHARD_MAX,
+              "OBJC_WEAK_SHARD_COUNT must not exceed OBJC_WEAK_SHARD_MAX");
+
+// (active stripe count - 1), used to map an object hash to a stripe.  Seeded
+// with the compile-time default and finalised by init_arc() once the
+// environment has been consulted.
+static size_t weakShardMask = OBJC_WEAK_SHARD_COUNT - 1;
 
 /**
  * Sentinel index meaning "no shard" for the lock guard below.
@@ -711,7 +735,7 @@ static const size_t WEAK_SHARD_NONE = ~static_cast<size_t>(0);
 static inline size_t weakShardIndex(const void *obj)
 {
 	uintptr_t a = reinterpret_cast<uintptr_t>(obj);
-	return ((a >> 4) ^ (a >> 12) ^ (a >> 20)) & (weakShardCount - 1);
+	return ((a >> 4) ^ (a >> 12) ^ (a >> 20)) & weakShardMask;
 }
 
 struct WeakRef
@@ -799,7 +823,7 @@ struct alignas(64) WeakRefShard
  */
 static inline WeakRefShard *weakShards()
 {
-	static WeakRefShard shards[weakShardCount];
+	static WeakRefShard shards[OBJC_WEAK_SHARD_MAX];
 	return shards;
 }
 
@@ -860,6 +884,23 @@ static const struct Block_callbacks_RR blocks_runtime_callbacks = {
 
 PRIVATE extern "C" void init_arc(void)
 {
+	// Let a deployment tune the weak-table stripe count.  Round the request
+	// down to a power of two in [1, OBJC_WEAK_SHARD_MAX] so the index mask
+	// stays valid; leave the compiled-in default in place otherwise.
+	if (const char *env = getenv("OBJC_WEAK_SHARD_COUNT"))
+	{
+		long requested = strtol(env, nullptr, 10);
+		if (requested >= 1)
+		{
+			size_t count = 1;
+			while (((count << 1) <= static_cast<size_t>(requested)) &&
+			       ((count << 1) <= OBJC_WEAK_SHARD_MAX))
+			{
+				count <<= 1;
+			}
+			weakShardMask = count - 1;
+		}
+	}
 	// Force construction of the weak-table shards (and initialisation of their
 	// locks) before any weak operation can run.
 	weakShards();
