@@ -1066,63 +1066,71 @@ extern "C" OBJC_PUBLIC id objc_storeWeak(id *addr, id obj)
 {
 	// This operation touches two objects: the one currently referenced by the
 	// slot (if any) and the new one.  Lock both owning shards (ordered, and
-	// de-duplicated if they coincide) for the duration.  Reading `*addr` here
-	// is safe without a lock: the slot has a single owning writer, and a
-	// concurrent dealloc only zeroes the control block's `obj`, never the
-	// slot's pointer to that block, so the peeked shard index is stable.
-	WeakRef *oldPeek = asWeakRef(*addr);
-	size_t sOld = oldPeek ? oldPeek->shardIndex : WEAK_SHARD_NONE;
+	// de-duplicated if they coincide) for the duration.  The old side is chosen
+	// from a lock-free peek of the slot, which can be repointed to a block in
+	// another shard between the peek and taking the lock; re-check it under the
+	// lock and retry if it moved.  The new side comes from `obj`, which the
+	// caller keeps alive, so its shard is stable.
 	size_t sNew = obj ? weakShardIndex(obj) : WEAK_SHARD_NONE;
-	WeakLockGuard g(sOld, sNew);
-	WeakRef *oldRef;
-	id old;
-	loadWeakPointer(addr, &old, &oldRef);
-	// If the old and new values are the same, then we don't need to do anything
-	// unless we are deleting the weak reference by storing NULL to it.
-	if ((old == obj) && ((obj != NULL) || (NULL == oldRef)))
+	for (;;)
 	{
-		return obj;
-	}
-	BOOL isGlobalObject = setObjectHasWeakRefs(obj);
-	// If we old ref exists, decrement its reference count.  This may also
-	// delete the weak reference control block.
-	if (oldRef != NULL)
-	{
-		weakRefRelease(oldRef);
-	}
-	// If we're storing nil, then just write a null pointer.
-	if (nil == obj)
-	{
-		*addr = obj;
-		return nil;
-	}
-	if (isGlobalObject)
-	{
-		// If this is a global object, it's never deallocated, so secretly make
-		// this a strong reference.
-		*addr = obj;
-		return obj;
-	}
-	Class cls = classForObject(obj);
-	if (UNLIKELY(objc_test_class_flag(cls, objc_class_flag_is_block)))
-	{
-		// Check whether the block is being deallocated and return nil if so
-		if (_Block_isDeallocating(obj)) {
+		WeakRef *oldPeek = asWeakRef(*addr);
+		size_t sOld = oldPeek ? oldPeek->shardIndex : WEAK_SHARD_NONE;
+		WeakLockGuard g(sOld, sNew);
+		if (asWeakRef(*addr) != oldPeek)
+		{
+			continue;
+		}
+		WeakRef *oldRef;
+		id old;
+		loadWeakPointer(addr, &old, &oldRef);
+		// If the old and new values are the same, then we don't need to do anything
+		// unless we are deleting the weak reference by storing NULL to it.
+		if ((old == obj) && ((obj != NULL) || (NULL == oldRef)))
+		{
+			return obj;
+		}
+		BOOL isGlobalObject = setObjectHasWeakRefs(obj);
+		// If we old ref exists, decrement its reference count.  This may also
+		// delete the weak reference control block.
+		if (oldRef != NULL)
+		{
+			weakRefRelease(oldRef);
+		}
+		// If we're storing nil, then just write a null pointer.
+		if (nil == obj)
+		{
+			*addr = obj;
+			return nil;
+		}
+		if (isGlobalObject)
+		{
+			// If this is a global object, it's never deallocated, so secretly make
+			// this a strong reference.
+			*addr = obj;
+			return obj;
+		}
+		Class cls = classForObject(obj);
+		if (UNLIKELY(objc_test_class_flag(cls, objc_class_flag_is_block)))
+		{
+			// Check whether the block is being deallocated and return nil if so
+			if (_Block_isDeallocating(obj)) {
+				*addr = nil;
+				return nil;
+			}
+		}
+		else if (object_getRetainCount_np(obj) == 0)
+		{
+			// If the object is being deallocated return nil.
 			*addr = nil;
 			return nil;
 		}
+		if (nil != obj)
+		{
+			*addr = (id)incrementWeakRefCount(obj);
+		}
+		return obj;
 	}
-	else if (object_getRetainCount_np(obj) == 0)
-	{
-		// If the object is being deallocated return nil.
-		*addr = nil;
-		return nil;
-	}
-	if (nil != obj)
-	{
-		*addr = (id)incrementWeakRefCount(obj);
-	}
-	return obj;
 }
 
 extern "C" OBJC_PUBLIC BOOL objc_delete_weak_refs(id obj)
@@ -1162,63 +1170,73 @@ extern "C" OBJC_PUBLIC BOOL objc_delete_weak_refs(id obj)
 
 extern "C" OBJC_PUBLIC id objc_loadWeakRetained(id* addr)
 {
-	// If this is really a strong reference (nil, or a non-deallocatable
-	// object), just return it -- no control block, no lock needed.
-	WeakRef *peek = asWeakRef(*addr);
-	if (peek == nullptr)
+	// Choose the owning shard from a lock-free peek of the slot.  A non-block
+	// value (nil or a non-deallocatable strong object) needs no lock.  The slot
+	// can be repointed to a block in another shard between the peek and taking
+	// the lock, which would leave us holding the wrong lock; re-check it under
+	// the lock and retry if it moved, so we never dereference a block whose
+	// shard we do not hold.
+	for (;;)
 	{
-		return *addr;
-	}
-	// Lock the shard that owns this control block before reading its `obj`,
-	// which a concurrent dealloc (holding the same shard) may be zeroing.
-	WeakLockGuard g(peek->shardIndex);
-	id obj;
-	WeakRef *ref;
-	if (!loadWeakPointer(addr, &obj, &ref))
-	{
-		return obj;
-	}
-	// The object cannot be deallocated while we hold the lock (release
-	// will acquire the lock before attempting to deallocate)
-	if (obj == nil)
-	{
-		// If the object is destroyed, drop this reference to the WeakRef
-		// struct.
-		if (ref != NULL)
+		id slot = *addr;
+		WeakRef *peek = asWeakRef(slot);
+		if (peek == nullptr)
 		{
-			weakRefRelease(ref);
-			*addr = nil;
+			return slot;
 		}
-		return nil;
-	}
-	Class cls = classForObject(obj);
-	if (objc_test_class_flag(cls, objc_class_flag_permanent_instances))
-	{
-		return obj;
-	}
-	else if (UNLIKELY(objc_test_class_flag(cls, objc_class_flag_is_block)))
-	{
-		obj = static_cast<id>(block_load_weak(obj));
-		if (obj == nil)
+		WeakLockGuard g(peek->shardIndex);
+		if (asWeakRef(*addr) != peek)
 		{
-			return nil;
+			continue;
 		}
-		// This is a defeasible retain operation that protects against another thread concurrently
-		// starting to deallocate the block.
-		if (_Block_tryRetain(obj))
+		id obj;
+		WeakRef *ref;
+		if (!loadWeakPointer(addr, &obj, &ref))
 		{
 			return obj;
 		}
-		return nil;
+		// The object cannot be deallocated while we hold the lock (release
+		// will acquire the lock before attempting to deallocate)
+		if (obj == nil)
+		{
+			// If the object is destroyed, drop this reference to the WeakRef
+			// struct.
+			if (ref != NULL)
+			{
+				weakRefRelease(ref);
+				*addr = nil;
+			}
+			return nil;
+		}
+		Class cls = classForObject(obj);
+		if (objc_test_class_flag(cls, objc_class_flag_permanent_instances))
+		{
+			return obj;
+		}
+		else if (UNLIKELY(objc_test_class_flag(cls, objc_class_flag_is_block)))
+		{
+			obj = static_cast<id>(block_load_weak(obj));
+			if (obj == nil)
+			{
+				return nil;
+			}
+			// This is a defeasible retain operation that protects against another thread concurrently
+			// starting to deallocate the block.
+			if (_Block_tryRetain(obj))
+			{
+				return obj;
+			}
+			return nil;
 
+		}
+		else if (!objc_test_class_flag(cls, objc_class_flag_fast_arc))
+		{
+			obj = _objc_weak_load(obj);
+		}
+		// _objc_weak_load() can return nil
+		if (obj == nil) { return nil; }
+		return retain(obj, YES);
 	}
-	else if (!objc_test_class_flag(cls, objc_class_flag_fast_arc))
-	{
-		obj = _objc_weak_load(obj);
-	}
-	// _objc_weak_load() can return nil
-	if (obj == nil) { return nil; }
-	return retain(obj, YES);
 }
 
 extern "C" OBJC_PUBLIC id objc_loadWeak(id* object)
@@ -1232,21 +1250,30 @@ extern "C" OBJC_PUBLIC void objc_copyWeak(id *dest, id *src)
 	// `src` is a valid pointer to a __weak pointer or nil.
 	// `dest` is a valid pointer to uninitialised memory.
 	// After this operation, `dest` should contain whatever `src` contained.
-	WeakRef *peek = asWeakRef(*src);
-	if (peek == nullptr)
+	for (;;)
 	{
-		// nil or a non-deallocatable strong object: no bookkeeping to do.
+		id slot = *src;
+		WeakRef *peek = asWeakRef(slot);
+		if (peek == nullptr)
+		{
+			// nil or a non-deallocatable strong object: no bookkeeping to do.
+			*dest = slot;
+			return;
+		}
+		WeakLockGuard g(peek->shardIndex);
+		if (asWeakRef(*src) != peek)
+		{
+			continue;
+		}
+		id obj;
+		WeakRef *srcRef;
+		loadWeakPointer(src, &obj, &srcRef);
 		*dest = *src;
+		if (srcRef)
+		{
+			srcRef->weak_count++;
+		}
 		return;
-	}
-	WeakLockGuard g(peek->shardIndex);
-	id obj;
-	WeakRef *srcRef;
-	loadWeakPointer(src, &obj, &srcRef);
-	*dest = *src;
-	if (srcRef)
-	{
-		srcRef->weak_count++;
 	}
 }
 
@@ -1260,29 +1287,45 @@ extern "C" OBJC_PUBLIC void objc_moveWeak(id *dest, id *src)
 	//
 	// Lock the shard owning the moved control block (if any) so this is atomic
 	// against a concurrent store to *src.  A nil/strong slot needs no lock.
-	WeakRef *peek = asWeakRef(*src);
-	WeakLockGuard g(peek ? peek->shardIndex : WEAK_SHARD_NONE);
-	*dest = *src;
-	*src = nil;
+	for (;;)
+	{
+		WeakRef *peek = asWeakRef(*src);
+		WeakLockGuard g(peek ? peek->shardIndex : WEAK_SHARD_NONE);
+		if (asWeakRef(*src) != peek)
+		{
+			continue;
+		}
+		*dest = *src;
+		*src = nil;
+		return;
+	}
 }
 
 extern "C" OBJC_PUBLIC void objc_destroyWeak(id* obj)
 {
-	WeakRef *peek = asWeakRef(*obj);
-	if (peek == nullptr)
+	for (;;)
 	{
-		// nil or a non-deallocatable strong object: nothing to release.
+		WeakRef *peek = asWeakRef(*obj);
+		if (peek == nullptr)
+		{
+			// nil or a non-deallocatable strong object: nothing to release.
+			return;
+		}
+		WeakLockGuard g(peek->shardIndex);
+		if (asWeakRef(*obj) != peek)
+		{
+			continue;
+		}
+		WeakRef *oldRef;
+		id old;
+		loadWeakPointer(obj, &old, &oldRef);
+		// If the old ref exists, decrement its reference count.  This may also
+		// delete the weak reference control block.
+		if (oldRef != NULL)
+		{
+			weakRefRelease(oldRef);
+		}
 		return;
-	}
-	WeakLockGuard g(peek->shardIndex);
-	WeakRef *oldRef;
-	id old;
-	loadWeakPointer(obj, &old, &oldRef);
-	// If the old ref exists, decrement its reference count.  This may also
-	// delete the weak reference control block.
-	if (oldRef != NULL)
-	{
-		weakRefRelease(oldRef);
 	}
 }
 
