@@ -690,12 +690,46 @@ static int weakref_class;
 
 namespace {
 
+/**
+ * Number of stripes for the weak-reference table.  Every weak operation keys
+ * off a single object address (two, in the case of `objc_storeWeak`), so
+ * sharding the table by object address lets weak traffic on unrelated objects
+ * proceed without serialising on one global lock.  Must be a power of two.
+ */
+static const size_t weakShardCount = 64;
+
+/**
+ * Sentinel index meaning "no shard" for the lock guard below.
+ */
+static const size_t WEAK_SHARD_NONE = ~static_cast<size_t>(0);
+
+/**
+ * Map an object address to a shard.  Heap objects are at least pointer
+ * aligned, so the low bits carry no entropy; fold in higher bits before
+ * masking to spread addresses across shards.
+ */
+static inline size_t weakShardIndex(const void *obj)
+{
+	uintptr_t a = reinterpret_cast<uintptr_t>(obj);
+	return ((a >> 4) ^ (a >> 12) ^ (a >> 20)) & (weakShardCount - 1);
+}
+
 struct WeakRef
 {
 	void *isa = &weakref_class;
 	id obj = nullptr;
 	size_t weak_count = 1;
-	WeakRef(id o) : obj(o) {}
+	// The shard that owns this control block.  Set once, when the block is
+	// first allocated, and never changed: a block is only ever recycled for
+	// another object in the same shard (see the per-shard free list below), so
+	// this stays constant for the life of the process.  That is what lets a
+	// slot-first operation read it lock-free to pick the owning shard without
+	// risking a use-after-free -- the block is type-stable and this field is
+	// immutable.
+	size_t shardIndex;
+	// Free-list link, valid only while the block sits on a shard's free list.
+	WeakRef *nextFree = nullptr;
+	WeakRef(id o) : obj(o), shardIndex(weakShardIndex(o)) {}
 };
 
 template<typename T>
@@ -736,13 +770,82 @@ using weak_ref_table = tsl::robin_pg_map<const void*,
                                          std::equal_to<const void*>,
                                          malloc_allocator<std::pair<const void*, WeakRef*>>>;
 
-weak_ref_table &weakRefs()
+/**
+ * One stripe of the weak-reference table: an independent lock and map.
+ *
+ * Aligned to a cache line (and thereby padded to a whole number of them) so
+ * that adjacent shards never share a line.  Without this, a thread operating
+ * on shard N would invalidate the line holding part of shard N+1, reintroducing
+ * false sharing between objects that the striping was meant to keep apart.
+ */
+struct alignas(64) WeakRefShard
 {
-	static weak_ref_table w{128};
-	return w;
+	mutex_t lock;
+	weak_ref_table table;
+	// Type-stable free list of recycled control blocks for this shard.  Blocks
+	// are never returned to the allocator; recycling them here keeps their
+	// memory (and their immutable `shardIndex`) valid forever, so a slot-first
+	// operation may read `shardIndex` without a lock to choose the shard.
+	// Guarded by `lock`.
+	WeakRef *freeList = nullptr;
+	WeakRefShard() : table(16) { INIT_LOCK(lock); }
+};
+
+/**
+ * Accessor for the shard array.  A function-local static guarantees the maps
+ * are constructed and the locks initialised on first use, before any weak
+ * operation can run, sidestepping static-initialisation ordering issues with
+ * runtime bring-up (mirroring the previous `weakRefs()` accessor).
+ */
+static inline WeakRefShard *weakShards()
+{
+	static WeakRefShard shards[weakShardCount];
+	return shards;
 }
 
-mutex_t weakRefLock;
+/**
+ * RAII guard that locks one or two shards (`WEAK_SHARD_NONE` = none) in
+ * ascending index order, de-duplicating equal indices.  The global ordering
+ * means two-object operations (`objc_storeWeak`) can never deadlock against
+ * one another.
+ */
+struct WeakLockGuard
+{
+	mutex_t *locks[2] = { nullptr, nullptr };
+	WeakLockGuard(size_t i, size_t j = WEAK_SHARD_NONE)
+	{
+		size_t a = i, b = j;
+		if ((a != WEAK_SHARD_NONE) && (b != WEAK_SHARD_NONE))
+		{
+			if (a == b) { b = WEAK_SHARD_NONE; }
+			else if (a > b) { size_t t = a; a = b; b = t; }
+		}
+		else if (a == WEAK_SHARD_NONE) { a = b; b = WEAK_SHARD_NONE; }
+		if (a != WEAK_SHARD_NONE) { locks[0] = &weakShards()[a].lock; LOCK(locks[0]); }
+		if (b != WEAK_SHARD_NONE) { locks[1] = &weakShards()[b].lock; LOCK(locks[1]); }
+	}
+	WeakLockGuard(const WeakLockGuard&) = delete;
+	WeakLockGuard &operator=(const WeakLockGuard&) = delete;
+	~WeakLockGuard()
+	{
+		if (locks[1]) { UNLOCK(locks[1]); }
+		if (locks[0]) { UNLOCK(locks[0]); }
+	}
+};
+
+/**
+ * If `p` is a weak-reference control block, return it without dereferencing
+ * its lock-protected `obj` field, so the caller can determine the owning shard
+ * before taking any lock.  Otherwise (nil or a real object) return nullptr.
+ */
+static inline WeakRef *asWeakRef(id p)
+{
+	if ((p != nil) && (classForObject(p) == (Class)&weakref_class))
+	{
+		return reinterpret_cast<WeakRef*>(p);
+	}
+	return nullptr;
+}
 
 }
 
@@ -757,7 +860,9 @@ static const struct Block_callbacks_RR blocks_runtime_callbacks = {
 
 PRIVATE extern "C" void init_arc(void)
 {
-	INIT_LOCK(weakRefLock);
+	// Force construction of the weak-table shards (and initialisation of their
+	// locks) before any weak operation can run.
+	weakShards();
 #ifdef arc_tls_store
 	ARCThreadKey = arc_tls_key_create((arc_cleanup_function_t)cleanupPools);
 #endif
@@ -793,14 +898,51 @@ static inline BOOL loadWeakPointer(id *addr, id *obj, WeakRef **ref)
 	return NO;
 }
 
+/**
+ * Obtain a control block for `obj` in its shard, recycling one from the shard's
+ * free list if available.  Caller must hold the shard lock.
+ */
+static inline WeakRef *allocWeakRef(id obj, size_t shard)
+{
+	WeakRefShard &s = weakShards()[shard];
+	WeakRef *ref = s.freeList;
+	if (ref != nullptr)
+	{
+		s.freeList = ref->nextFree;
+		ref->isa = &weakref_class;
+		ref->obj = obj;
+		ref->weak_count = 1;
+		ref->nextFree = nullptr;
+		// shardIndex is already == shard and never changes.
+	}
+	else
+	{
+		ref = new WeakRef(obj);
+	}
+	return ref;
+}
+
+/**
+ * Return a control block to its shard's free list instead of freeing it, so
+ * its memory (and immutable shardIndex) stay valid for lock-free shard
+ * selection.  Caller must hold the shard lock.
+ */
+static inline void recycleWeakRef(WeakRef *ref)
+{
+	WeakRefShard &s = weakShards()[ref->shardIndex];
+	ref->obj = nil;
+	ref->nextFree = s.freeList;
+	s.freeList = ref;
+}
+
 __attribute__((always_inline))
 static inline BOOL weakRefRelease(WeakRef *ref)
 {
 	ref->weak_count--;
 	if (ref->weak_count == 0)
 	{
-		weakRefs().erase(ref->obj);
-		delete ref;
+		weakShards()[ref->shardIndex].table.erase(ref->obj);
+		recycleWeakRef(ref);
 		return YES;
 	}
 	return NO;
@@ -842,6 +984,12 @@ static BOOL setObjectHasWeakRefs(id obj)
 			// shouldn't be possible, because `obj` should be a strong
 			// reference and so it shouldn't be possible to deallocate it
 			// while we're assigning it.
+			//
+			// Relaxed ordering suffices: the flag lives in the reference
+			// count word, so the CAS in the release path (itself a
+			// read-modify-write) always observes it via the location's
+			// modification order.  Visibility of the weak-table entry we
+			// publish next is provided by the shard lock, not by this atomic.
 			uintptr_t updated = ((uintptr_t)realCount | weak_mask);
 			// Acquire/release on the exchange, matching the other
 			// reference-count updates.  The weak-ref lock, held here, orders
@@ -859,10 +1007,11 @@ static BOOL setObjectHasWeakRefs(id obj)
 
 WeakRef *incrementWeakRefCount(id obj)
 {
-	WeakRef *&ref = weakRefs()[obj];
+	size_t shard = weakShardIndex(obj);
+	WeakRef *&ref = weakShards()[shard].table[obj];
 	if (ref == nullptr)
 	{
-		ref = new WeakRef(obj);
+		ref = allocWeakRef(obj, shard);
 	}
 	else
 	{
@@ -874,7 +1023,16 @@ WeakRef *incrementWeakRefCount(id obj)
 
 extern "C" OBJC_PUBLIC id objc_storeWeak(id *addr, id obj)
 {
-	LOCK_FOR_SCOPE(&weakRefLock);
+	// This operation touches two objects: the one currently referenced by the
+	// slot (if any) and the new one.  Lock both owning shards (ordered, and
+	// de-duplicated if they coincide) for the duration.  Reading `*addr` here
+	// is safe without a lock: the slot has a single owning writer, and a
+	// concurrent dealloc only zeroes the control block's `obj`, never the
+	// slot's pointer to that block, so the peeked shard index is stable.
+	WeakRef *oldPeek = asWeakRef(*addr);
+	size_t sOld = oldPeek ? oldPeek->shardIndex : WEAK_SHARD_NONE;
+	size_t sNew = obj ? weakShardIndex(obj) : WEAK_SHARD_NONE;
+	WeakLockGuard g(sOld, sNew);
 	WeakRef *oldRef;
 	id old;
 	loadWeakPointer(addr, &old, &oldRef);
@@ -928,7 +1086,7 @@ extern "C" OBJC_PUBLIC id objc_storeWeak(id *addr, id obj)
 
 extern "C" OBJC_PUBLIC BOOL objc_delete_weak_refs(id obj)
 {
-	LOCK_FOR_SCOPE(&weakRefLock);
+	WeakLockGuard g(weakShardIndex(obj));
 	if (objc_test_class_flag(classForObject(obj), objc_class_flag_fast_arc))
 	{
 		// Don't proceed if the object isn't deallocating.
@@ -940,7 +1098,7 @@ extern "C" OBJC_PUBLIC BOOL objc_delete_weak_refs(id obj)
 			return NO;
 		}
 	}
-	auto &table = weakRefs();
+	auto &table = weakShards()[weakShardIndex(obj)].table;
 	auto old = table.find(obj);
 	if (old != table.end())
 	{
@@ -963,11 +1121,18 @@ extern "C" OBJC_PUBLIC BOOL objc_delete_weak_refs(id obj)
 
 extern "C" OBJC_PUBLIC id objc_loadWeakRetained(id* addr)
 {
-	LOCK_FOR_SCOPE(&weakRefLock);
+	// If this is really a strong reference (nil, or a non-deallocatable
+	// object), just return it -- no control block, no lock needed.
+	WeakRef *peek = asWeakRef(*addr);
+	if (peek == nullptr)
+	{
+		return *addr;
+	}
+	// Lock the shard that owns this control block before reading its `obj`,
+	// which a concurrent dealloc (holding the same shard) may be zeroing.
+	WeakLockGuard g(peek->shardIndex);
 	id obj;
 	WeakRef *ref;
-	// If this is really a strong reference (nil, or an non-deallocatable
-	// object), just return it.
 	if (!loadWeakPointer(addr, &obj, &ref))
 	{
 		return obj;
@@ -1026,7 +1191,14 @@ extern "C" OBJC_PUBLIC void objc_copyWeak(id *dest, id *src)
 	// `src` is a valid pointer to a __weak pointer or nil.
 	// `dest` is a valid pointer to uninitialised memory.
 	// After this operation, `dest` should contain whatever `src` contained.
-	LOCK_FOR_SCOPE(&weakRefLock);
+	WeakRef *peek = asWeakRef(*src);
+	if (peek == nullptr)
+	{
+		// nil or a non-deallocatable strong object: no bookkeeping to do.
+		*dest = *src;
+		return;
+	}
+	WeakLockGuard g(peek->shardIndex);
 	id obj;
 	WeakRef *srcRef;
 	loadWeakPointer(src, &obj, &srcRef);
@@ -1045,18 +1217,23 @@ extern "C" OBJC_PUBLIC void objc_moveWeak(id *dest, id *src)
 	// This operation moves from *src to *dest and must be atomic with respect
 	// to other stores to *src via `objc_storeWeak`.
 	//
-	// Acquire the lock so that we guarantee the atomicity.  We could probably
-	// optimise this by doing an atomic exchange of `*src` with `nil` and
-	// storing the result in `dest`, but it's probably not worth it unless weak
-	// references are a bottleneck.
-	LOCK_FOR_SCOPE(&weakRefLock);
+	// Lock the shard owning the moved control block (if any) so this is atomic
+	// against a concurrent store to *src.  A nil/strong slot needs no lock.
+	WeakRef *peek = asWeakRef(*src);
+	WeakLockGuard g(peek ? peek->shardIndex : WEAK_SHARD_NONE);
 	*dest = *src;
 	*src = nil;
 }
 
 extern "C" OBJC_PUBLIC void objc_destroyWeak(id* obj)
 {
-	LOCK_FOR_SCOPE(&weakRefLock);
+	WeakRef *peek = asWeakRef(*obj);
+	if (peek == nullptr)
+	{
+		// nil or a non-deallocatable strong object: nothing to release.
+		return;
+	}
+	WeakLockGuard g(peek->shardIndex);
 	WeakRef *oldRef;
 	id old;
 	loadWeakPointer(obj, &old, &oldRef);
@@ -1075,7 +1252,7 @@ extern "C" OBJC_PUBLIC id objc_initWeak(id *addr, id obj)
 		*addr = nil;
 		return nil;
 	}
-	LOCK_FOR_SCOPE(&weakRefLock);
+	WeakLockGuard g(weakShardIndex(obj));
 	BOOL isGlobalObject = setObjectHasWeakRefs(obj);
 	if (isGlobalObject)
 	{
