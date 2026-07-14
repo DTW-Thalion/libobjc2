@@ -740,7 +740,7 @@ static inline size_t weakShardIndex(const void *obj)
 
 struct WeakRef
 {
-	void *isa = &weakref_class;
+	void *isa;
 	id obj = nullptr;
 	size_t weak_count = 1;
 	// The shard that owns this control block.  Set once, when the block is
@@ -753,7 +753,11 @@ struct WeakRef
 	size_t shardIndex;
 	// Free-list link, valid only while the block sits on a shard's free list.
 	WeakRef *nextFree = nullptr;
-	WeakRef(id o) : obj(o), shardIndex(weakShardIndex(o)) {}
+	WeakRef(id o) : obj(o), shardIndex(weakShardIndex(o))
+	{
+		// isa is read without a lock by asWeakRef, so publish it atomically.
+		__atomic_store_n(&isa, (void*)&weakref_class, __ATOMIC_RELAXED);
+	}
 };
 
 template<typename T>
@@ -858,13 +862,38 @@ struct WeakLockGuard
 };
 
 /**
- * If `p` is a weak-reference control block, return it without dereferencing
- * its lock-protected `obj` field, so the caller can determine the owning shard
- * before taking any lock.  Otherwise (nil or a real object) return nullptr.
+ * A weak slot (a `__weak id` variable) is read and written by operations that
+ * hold different shard locks -- whichever shard owns the block the slot points
+ * at -- so no single lock serialises access to the slot itself.  Access it
+ * atomically: a release store pairs with an acquire load so that a thread which
+ * observes a newly published control-block pointer also observes the block's
+ * fully constructed contents (which matters on weakly-ordered targets).
+ */
+static inline id weakSlotLoad(id *slot)
+{
+	// __atomic builtins reject ObjC object pointer types, so operate on the
+	// slot as a plain pointer word.
+	return (id)__atomic_load_n((void**)slot, __ATOMIC_ACQUIRE);
+}
+static inline void weakSlotStore(id *slot, id value)
+{
+	__atomic_store_n((void**)slot, (void*)value, __ATOMIC_RELEASE);
+}
+
+/**
+ * If `p` is a weak-reference control block, return it without dereferencing its
+ * lock-protected `obj` field, so the caller can determine the owning shard
+ * before taking any lock.  Otherwise (nil, a tagged pointer, or a real object)
+ * return nullptr.  The isa is read atomically: a concurrent recycle may
+ * re-publish the same isa value on another thread, so a plain read would race.
  */
 static inline WeakRef *asWeakRef(id p)
 {
-	if ((p != nil) && (classForObject(p) == (Class)&weakref_class))
+	if ((p == nil) || isSmallObject(p))
+	{
+		return nullptr;
+	}
+	if (__atomic_load_n((void**)&p->isa, __ATOMIC_RELAXED) == (void*)&weakref_class)
 	{
 		return reinterpret_cast<WeakRef*>(p);
 	}
@@ -921,17 +950,17 @@ PRIVATE extern "C" void init_arc(void)
 __attribute__((always_inline))
 static inline BOOL loadWeakPointer(id *addr, id *obj, WeakRef **ref)
 {
-	id oldObj = *addr;
+	id oldObj = weakSlotLoad(addr);
 	if (oldObj == nil)
 	{
 		*ref = NULL;
 		*obj = nil;
 		return NO;
 	}
-	if (classForObject(oldObj) == (Class)&weakref_class)
+	if (WeakRef *wr = asWeakRef(oldObj))
 	{
-		*ref = (WeakRef*)oldObj;
-		*obj = (*ref)->obj;
+		*ref = wr;
+		*obj = wr->obj;
 		return YES;
 	}
 	*ref = NULL;
@@ -950,7 +979,7 @@ static inline WeakRef *allocWeakRef(id obj, size_t shard)
 	if (ref != nullptr)
 	{
 		s.freeList = ref->nextFree;
-		ref->isa = &weakref_class;
+		__atomic_store_n(&ref->isa, (void*)&weakref_class, __ATOMIC_RELAXED);
 		ref->obj = obj;
 		ref->weak_count = 1;
 		ref->nextFree = nullptr;
@@ -1074,10 +1103,10 @@ extern "C" OBJC_PUBLIC id objc_storeWeak(id *addr, id obj)
 	size_t sNew = obj ? weakShardIndex(obj) : WEAK_SHARD_NONE;
 	for (;;)
 	{
-		WeakRef *oldPeek = asWeakRef(*addr);
+		WeakRef *oldPeek = asWeakRef(weakSlotLoad(addr));
 		size_t sOld = oldPeek ? oldPeek->shardIndex : WEAK_SHARD_NONE;
 		WeakLockGuard g(sOld, sNew);
-		if (asWeakRef(*addr) != oldPeek)
+		if (asWeakRef(weakSlotLoad(addr)) != oldPeek)
 		{
 			continue;
 		}
@@ -1100,14 +1129,14 @@ extern "C" OBJC_PUBLIC id objc_storeWeak(id *addr, id obj)
 		// If we're storing nil, then just write a null pointer.
 		if (nil == obj)
 		{
-			*addr = obj;
+			weakSlotStore(addr, obj);
 			return nil;
 		}
 		if (isGlobalObject)
 		{
 			// If this is a global object, it's never deallocated, so secretly make
 			// this a strong reference.
-			*addr = obj;
+			weakSlotStore(addr, obj);
 			return obj;
 		}
 		Class cls = classForObject(obj);
@@ -1115,19 +1144,19 @@ extern "C" OBJC_PUBLIC id objc_storeWeak(id *addr, id obj)
 		{
 			// Check whether the block is being deallocated and return nil if so
 			if (_Block_isDeallocating(obj)) {
-				*addr = nil;
+				weakSlotStore(addr, nil);
 				return nil;
 			}
 		}
 		else if (object_getRetainCount_np(obj) == 0)
 		{
 			// If the object is being deallocated return nil.
-			*addr = nil;
+			weakSlotStore(addr, nil);
 			return nil;
 		}
 		if (nil != obj)
 		{
-			*addr = (id)incrementWeakRefCount(obj);
+			weakSlotStore(addr, (id)incrementWeakRefCount(obj));
 		}
 		return obj;
 	}
@@ -1178,14 +1207,14 @@ extern "C" OBJC_PUBLIC id objc_loadWeakRetained(id* addr)
 	// shard we do not hold.
 	for (;;)
 	{
-		id slot = *addr;
+		id slot = weakSlotLoad(addr);
 		WeakRef *peek = asWeakRef(slot);
 		if (peek == nullptr)
 		{
 			return slot;
 		}
 		WeakLockGuard g(peek->shardIndex);
-		if (asWeakRef(*addr) != peek)
+		if (asWeakRef(weakSlotLoad(addr)) != peek)
 		{
 			continue;
 		}
@@ -1204,7 +1233,7 @@ extern "C" OBJC_PUBLIC id objc_loadWeakRetained(id* addr)
 			if (ref != NULL)
 			{
 				weakRefRelease(ref);
-				*addr = nil;
+				weakSlotStore(addr, nil);
 			}
 			return nil;
 		}
@@ -1252,7 +1281,7 @@ extern "C" OBJC_PUBLIC void objc_copyWeak(id *dest, id *src)
 	// After this operation, `dest` should contain whatever `src` contained.
 	for (;;)
 	{
-		id slot = *src;
+		id slot = weakSlotLoad(src);
 		WeakRef *peek = asWeakRef(slot);
 		if (peek == nullptr)
 		{
@@ -1261,14 +1290,14 @@ extern "C" OBJC_PUBLIC void objc_copyWeak(id *dest, id *src)
 			return;
 		}
 		WeakLockGuard g(peek->shardIndex);
-		if (asWeakRef(*src) != peek)
+		if (asWeakRef(weakSlotLoad(src)) != peek)
 		{
 			continue;
 		}
 		id obj;
 		WeakRef *srcRef;
 		loadWeakPointer(src, &obj, &srcRef);
-		*dest = *src;
+		*dest = weakSlotLoad(src);
 		if (srcRef)
 		{
 			srcRef->weak_count++;
@@ -1289,14 +1318,14 @@ extern "C" OBJC_PUBLIC void objc_moveWeak(id *dest, id *src)
 	// against a concurrent store to *src.  A nil/strong slot needs no lock.
 	for (;;)
 	{
-		WeakRef *peek = asWeakRef(*src);
+		WeakRef *peek = asWeakRef(weakSlotLoad(src));
 		WeakLockGuard g(peek ? peek->shardIndex : WEAK_SHARD_NONE);
-		if (asWeakRef(*src) != peek)
+		if (asWeakRef(weakSlotLoad(src)) != peek)
 		{
 			continue;
 		}
-		*dest = *src;
-		*src = nil;
+		*dest = weakSlotLoad(src);
+		weakSlotStore(src, nil);
 		return;
 	}
 }
@@ -1305,14 +1334,14 @@ extern "C" OBJC_PUBLIC void objc_destroyWeak(id* obj)
 {
 	for (;;)
 	{
-		WeakRef *peek = asWeakRef(*obj);
+		WeakRef *peek = asWeakRef(weakSlotLoad(obj));
 		if (peek == nullptr)
 		{
 			// nil or a non-deallocatable strong object: nothing to release.
 			return;
 		}
 		WeakLockGuard g(peek->shardIndex);
-		if (asWeakRef(*obj) != peek)
+		if (asWeakRef(weakSlotLoad(obj)) != peek)
 		{
 			continue;
 		}
@@ -1333,7 +1362,7 @@ extern "C" OBJC_PUBLIC id objc_initWeak(id *addr, id obj)
 {
 	if (obj == nil)
 	{
-		*addr = nil;
+		weakSlotStore(addr, nil);
 		return nil;
 	}
 	WeakLockGuard g(weakShardIndex(obj));
@@ -1342,18 +1371,18 @@ extern "C" OBJC_PUBLIC id objc_initWeak(id *addr, id obj)
 	{
 		// If this is a global object, it's never deallocated, so secretly make
 		// this a strong reference.
-		*addr = obj;
+		weakSlotStore(addr, obj);
 		return obj;
 	}
 	// If the object is being deallocated return nil.
 	if (object_getRetainCount_np(obj) == 0)
 	{
-		*addr = nil;
+		weakSlotStore(addr, nil);
 		return nil;
 	}
 	if (nil != obj)
 	{
-		*(WeakRef**)addr = incrementWeakRefCount(obj);
+		weakSlotStore(addr, (id)incrementWeakRefCount(obj));
 	}
 	return obj;
 }
