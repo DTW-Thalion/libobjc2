@@ -264,9 +264,17 @@ static const long refcount_shift = 1;
  */
 static const size_t weak_mask = ((size_t)1)<<((sizeof(size_t)*8)-refcount_shift);
 /**
- * All of the bits other than the top bit are the real reference count.
+ * The bit immediately below the weak flag is reserved as a guard.  It is never
+ * part of the logical reference count, so an optimistic `fetch_add` in the
+ * strong-retain fast path can carry a maxed-out count into the guard bit
+ * without ever reaching (and corrupting) the weak flag above it.
  */
-static const size_t refcount_mask = ~weak_mask;
+static const size_t guard_mask = weak_mask >> 1;
+/**
+ * All of the bits other than the weak flag and the guard bit are the real
+ * reference count.
+ */
+static const size_t refcount_mask = ~(weak_mask | guard_mask);
 static const size_t refcount_max = refcount_mask - 1;
 
 extern "C" OBJC_PUBLIC size_t object_getRetainCount_np(id obj)
@@ -280,6 +288,29 @@ extern "C" OBJC_PUBLIC size_t object_getRetainCount_np(id obj)
 static id retain_fast(id obj, BOOL isWeak)
 {
 	auto *refCount = reinterpret_cast<std::atomic<uintptr_t>*>(obj) - 1;
+	if (LIKELY(!isWeak))
+	{
+		// Strong retain.  The caller already owns a reference, so the object
+		// cannot be at (or reach) the deallocating sentinel while we run: the
+		// final release can only happen once every strong reference, including
+		// the caller's, is gone.  A single fetch_add is therefore safe, and
+		// the guard bit above the count means even a saturating increment
+		// cannot carry into the weak flag.  This replaces the compare-exchange
+		// retry loop, which re-spins on every lost race under contention.
+		uintptr_t old = refCount->fetch_add(1, std::memory_order_acq_rel);
+		if (LIKELY((old & refcount_mask) < refcount_max))
+		{
+			return obj;
+		}
+		// Saturated (unreachable for any real object: it needs 2^62 live
+		// references).  Undo the speculative increment and leave the count
+		// pinned.  The guard bit guaranteed the weak flag was untouched.
+		refCount->fetch_sub(1, std::memory_order_relaxed);
+		return obj;
+	}
+	// Weak-to-strong.  This can race a concurrent final release, so we must
+	// atomically check-and-increment (a fetch_add could resurrect an object
+	// that is already deallocating).  Keep the compare-exchange loop.
 	uintptr_t refCountVal = refCount->load(std::memory_order_relaxed);
 	for (;;)
 	{
@@ -363,49 +394,42 @@ static inline id retain(id obj, BOOL isWeak)
 extern "C" OBJC_PUBLIC BOOL objc_release_fast_no_destroy_np(id obj)
 {
 	auto *refCount = reinterpret_cast<std::atomic<uintptr_t>*>(obj) - 1;
-	uintptr_t refCountVal = refCount->load(std::memory_order_relaxed);
-	bool isWeak;
-	bool shouldFree;
-	for (;;)
+	// Release ordering on the decrement so that writes made through the
+	// references being dropped are visible to whichever thread performs the
+	// final release.  A single fetch_sub replaces the compare-exchange loop.
+	uintptr_t old = refCount->fetch_sub(1, std::memory_order_release);
+	size_t oldCount = old & refcount_mask;
+	bool isWeak = (old & weak_mask) == weak_mask;
+	if (LIKELY((oldCount != 0) && (oldCount < refcount_max)))
 	{
-		size_t realCount = refCountVal & refcount_mask;
-		// If the reference count is saturated or deallocating, don't decrement it.
-		if (realCount >= refcount_max)
+		// The common case: a live object that still has other references.
+		return NO;
+	}
+	if (oldCount >= refcount_max)
+	{
+		// The count was saturated or already at the deallocating sentinel
+		// (the latter only from an over-release).  We must not have
+		// decremented it; undo.  The guard bit keeps the undo off the weak
+		// flag.
+		refCount->fetch_add(1, std::memory_order_relaxed);
+		return NO;
+	}
+	// oldCount == 0 (a retain count of one): this dropped the last reference,
+	// so the object should be destroyed.  The subtraction leaves the count
+	// field at the deallocating sentinel, which is what every other path keys
+	// off; the borrow also flips the weak flag, but that is never observed --
+	// -objc_delete_weak_refs and -setObjectHasWeakRefs both test the count
+	// sentinel, isWeak was read from the pre-decrement value, and the word is
+	// freed immediately after.
+	std::atomic_thread_fence(std::memory_order_acquire);
+	if (isWeak)
+	{
+		if (!objc_delete_weak_refs(obj))
 		{
 			return NO;
 		}
-		realCount--;
-		isWeak = (refCountVal & weak_mask) == weak_mask;
-		shouldFree = realCount == -1;
-		realCount |= refCountVal & weak_mask;
-		uintptr_t updated = (uintptr_t)realCount;
-		// Release ordering on the decrement so that writes made through the
-		// references being dropped are visible to whichever thread performs
-		// the final release.  refCountVal is refreshed on a failed exchange.
-		if (refCount->compare_exchange_weak(refCountVal, updated,
-		                                    std::memory_order_release,
-		                                    std::memory_order_relaxed))
-		{
-			break;
-		}
 	}
-
-	if (shouldFree)
-	{
-		// Acquire fence pairing with the release above, so this thread sees
-		// every write made under the object's prior references before it
-		// runs -dealloc.
-		std::atomic_thread_fence(std::memory_order_acquire);
-		if (isWeak)
-		{
-			if (!objc_delete_weak_refs(obj))
-			{
-				return NO;
-			}
-		}
-		return YES;
-	}
-	return NO;
+	return YES;
 }
 
 extern "C" OBJC_PUBLIC void objc_release_fast_np(id obj)
